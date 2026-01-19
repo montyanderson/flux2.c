@@ -19,7 +19,7 @@ LIB = libflux.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps
+.PHONY: all clean debug lib install info test pngtest help generic blas mps cuda
 
 # Default: show available targets
 all: help
@@ -34,6 +34,9 @@ ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
 endif
+endif
+ifeq ($(UNAME_S),Linux)
+	@echo "  make cuda     - NVIDIA GPU with cuBLAS (fastest)"
 endif
 	@echo ""
 	@echo "Other targets:"
@@ -102,6 +105,28 @@ mps:
 endif
 
 # =============================================================================
+# Backend: cuda (NVIDIA GPU with cuBLAS + OpenBLAS fallback)
+# =============================================================================
+CUDA_PATH ?= /usr/local/cuda
+NVCC = $(CUDA_PATH)/bin/nvcc
+CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -DUSE_BLAS -DUSE_OPENBLAS -I$(CUDA_PATH)/include -I/usr/include/openblas
+CUDA_NVCCFLAGS = -O3 -arch=native --compiler-options -fPIC
+CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lstdc++ -lopenblas
+
+cuda: clean cuda-build
+	@echo ""
+	@echo "Built with CUDA backend (GPU acceleration via cuBLAS)"
+
+cuda-build: $(SRCS:.c=.cuda.o) flux_cuda.o main.cuda.o
+	$(CC) $(CUDA_CFLAGS) -o $(TARGET) $^ $(CUDA_LDFLAGS)
+
+%.cuda.o: %.c flux.h flux_kernels.h
+	$(CC) $(CUDA_CFLAGS) -c -o $@ $<
+
+flux_cuda.o: flux_cuda.cu flux_cuda.h
+	$(NVCC) $(CUDA_NVCCFLAGS) -c -o $@ $<
+
+# =============================================================================
 # Build rules
 # =============================================================================
 $(TARGET): $(OBJS) main.o
@@ -156,7 +181,7 @@ install: $(TARGET) $(LIB)
 	install -m 644 flux_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) *.mps.o *.cuda.o flux_metal.o flux_cuda.o main.o $(TARGET) $(LIB)
 
 info:
 	@echo "Platform: $(UNAME_S) $(UNAME_M)"

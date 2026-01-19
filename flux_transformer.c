@@ -50,6 +50,11 @@ static double tf_get_time_ms(void) {
 #include "flux_metal.h"
 #endif
 
+/* Use CUDA for GPU acceleration on NVIDIA GPUs */
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#endif
+
 /* Helper macro for using bf16 linear layer when available
  * Uses bf16 if w_bf16 is not NULL (GPU), otherwise falls back to f32 */
 #define LINEAR_BF16_OR_F32(out, x, w_f32, w_bf16, seq, in_dim, out_dim) \
@@ -637,6 +642,28 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
     }
 #endif
 
+#ifdef USE_CUDA
+    /* CUDA batched attention - all heads processed in parallel */
+    if (flux_cuda_available()) {
+        float *q_t = tf->attn_q_t;
+        float *k_t = tf->attn_k_t;
+        float *v_t = tf->attn_v_t;
+        float *out_t = tf->attn_out_t;
+
+        /* Transpose to [heads, seq, head_dim] for GPU batched attention */
+        transpose_shd_to_hsd(q_t, q, seq, tf->num_heads, head_dim);
+        transpose_shd_to_hsd(k_t, k, seq, tf->num_heads, head_dim);
+        transpose_shd_to_hsd(v_t, v, seq, tf->num_heads, head_dim);
+
+        flux_cuda_attention(out_t, q_t, k_t, v_t,
+                            tf->num_heads, seq, seq, head_dim, scale);
+
+        /* Transpose output back to [seq, heads, head_dim] */
+        transpose_hsd_to_shd(out, out_t, seq, tf->num_heads, head_dim);
+        return;
+    }
+#endif
+
     /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
 #ifdef USE_BLAS
     /* BLAS path: transpose + batched matrix multiply per head */
@@ -742,6 +769,36 @@ static void joint_attention(float *img_out, float *txt_out,
         /* Text attention: txt_Q @ cat_K^T, softmax, @ cat_V */
         flux_metal_attention(txt_out_t, txt_q_t, cat_k_t, cat_v_t, scores,
                              heads, txt_seq, total_seq, head_dim, scale);
+
+        /* Transpose outputs back */
+        transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);
+        transpose_hsd_to_shd(txt_out, txt_out_t, txt_seq, heads, head_dim);
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    /* CUDA batched attention - all heads processed in parallel */
+    if (flux_cuda_available()) {
+        float *img_q_t = tf->attn_q_t;
+        float *txt_q_t = tf->attn_q_t + img_seq * hidden;
+        float *cat_k_t = tf->attn_k_t;
+        float *cat_v_t = tf->attn_v_t;
+        float *img_out_t = tf->attn_out_t;
+        float *txt_out_t = tf->attn_out_t + img_seq * hidden;
+
+        /* Transpose to [heads, seq, head_dim] for GPU batched attention */
+        transpose_shd_to_hsd(img_q_t, img_q, img_seq, heads, head_dim);
+        transpose_shd_to_hsd(txt_q_t, txt_q, txt_seq, heads, head_dim);
+        transpose_shd_to_hsd(cat_k_t, cat_k, total_seq, heads, head_dim);
+        transpose_shd_to_hsd(cat_v_t, cat_v, total_seq, heads, head_dim);
+
+        /* Image attention: img_Q @ cat_K^T, softmax, @ cat_V */
+        flux_cuda_attention(img_out_t, img_q_t, cat_k_t, cat_v_t,
+                            heads, img_seq, total_seq, head_dim, scale);
+        /* Text attention: txt_Q @ cat_K^T, softmax, @ cat_V */
+        flux_cuda_attention(txt_out_t, txt_q_t, cat_k_t, cat_v_t,
+                            heads, txt_seq, total_seq, head_dim, scale);
 
         /* Transpose outputs back */
         transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);

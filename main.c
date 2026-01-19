@@ -19,6 +19,7 @@
  *   -t, --strength N      Img2img strength (0.0-1.0)
  *   -q, --quiet           No output, just generate
  *   -v, --verbose         Extra detailed output
+ *   -r, --repeat N        Generate N images (for warm benchmarking)
  *   -h, --help            Show help
  */
 
@@ -33,6 +34,10 @@
 
 #ifdef USE_METAL
 #include "flux_metal.h"
+#endif
+
+#ifdef USE_CUDA
+#include "flux_cuda.h"
 #endif
 
 /* ========================================================================
@@ -230,6 +235,12 @@ int main(int argc, char *argv[]) {
     flux_metal_init();
 #endif
 
+#ifdef USE_CUDA
+    if (flux_cuda_init() != 0) {
+        fprintf(stderr, "Warning: CUDA initialization failed, using CPU\n");
+    }
+#endif
+
     /* Command line options */
     static struct option long_options[] = {
         {"dir",        required_argument, 0, 'd'},
@@ -246,6 +257,7 @@ int main(int argc, char *argv[]) {
         {"noise",      required_argument, 0, 'n'},
         {"quiet",      no_argument,       0, 'q'},
         {"verbose",    no_argument,       0, 'v'},
+        {"repeat",     required_argument, 0, 'r'},
         {"help",       no_argument,       0, 'h'},
         {"version",    no_argument,       0, 'V'},
         {0, 0, 0, 0}
@@ -269,9 +281,10 @@ int main(int argc, char *argv[]) {
     };
 
     int width_set = 0, height_set = 0;
+    int repeat_count = 1;  /* Number of images to generate */
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhV",
+    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:r:qvhV",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': model_dir = optarg; break;
@@ -286,6 +299,7 @@ int main(int argc, char *argv[]) {
             case 't': params.strength = atof(optarg); break;
             case 'e': embeddings_path = optarg; break;
             case 'n': noise_path = optarg; break;
+            case 'r': repeat_count = atoi(optarg); break;
             case 'q': output_level = OUTPUT_QUIET; break;
             case 'v': output_level = OUTPUT_VERBOSE; break;
             case 'h': print_usage(argv[0]); return 0;
@@ -377,160 +391,217 @@ int main(int argc, char *argv[]) {
         cli_setup_progress();
     }
 
-    /* Generate image */
-    flux_image *output = NULL;
-    struct timeval total_start_tv;
-    gettimeofday(&total_start_tv, NULL);
+    /* Generation loop (for warm benchmarking with --repeat) */
+    struct timeval session_start_tv;
+    gettimeofday(&session_start_tv, NULL);
 
-    if (input_path) {
-        /* ============== Image-to-image mode ============== */
-        LOG_NORMAL("Loading input image...");
-        if (output_level >= OUTPUT_NORMAL) fflush(stderr);
-        timer_begin();
-
-        flux_image *input = flux_image_load(input_path);
-        if (!input) {
-            fprintf(stderr, "\nError: Failed to load input image: %s\n", input_path);
-            flux_free(ctx);
-            return 1;
+    for (int iter = 0; iter < repeat_count; iter++) {
+        if (repeat_count > 1) {
+            LOG_NORMAL("\n=== Generation %d/%d ===\n", iter + 1, repeat_count);
         }
 
-        LOG_NORMAL(" done (%.1fs)\n", timer_end());
-        LOG_VERBOSE("  Input: %dx%d, %d channels\n",
-                    input->width, input->height, input->channels);
+        /* Generate image */
+        flux_image *output = NULL;
+        struct timeval total_start_tv;
+        gettimeofday(&total_start_tv, NULL);
 
-        /* Use input image dimensions if not explicitly set */
-        if (!width_set) params.width = input->width;
-        if (!height_set) params.height = input->height;
+        /* Reset progress display state for each iteration */
+        cli_current_step = 0;
+        cli_legend_printed = 0;
 
-        /* Generate */
-        output = flux_img2img(ctx, prompt, input, &params);
-        flux_image_free(input);
+        if (input_path) {
+            /* ============== Image-to-image mode ============== */
+            LOG_NORMAL("Loading input image...");
+            if (output_level >= OUTPUT_NORMAL) fflush(stderr);
+            timer_begin();
 
-    } else if (embeddings_path) {
-        /* ============== External embeddings mode ============== */
-        LOG_NORMAL("Loading embeddings...");
-        if (output_level >= OUTPUT_NORMAL) fflush(stderr);
-        timer_begin();
+            flux_image *input = flux_image_load(input_path);
+            if (!input) {
+                fprintf(stderr, "\nError: Failed to load input image: %s\n", input_path);
+                flux_free(ctx);
+                return 1;
+            }
 
-        FILE *emb_file = fopen(embeddings_path, "rb");
-        if (!emb_file) {
-            fprintf(stderr, "\nError: Failed to open embeddings file: %s\n", embeddings_path);
-            flux_free(ctx);
-            return 1;
-        }
+            LOG_NORMAL(" done (%.1fs)\n", timer_end());
+            LOG_VERBOSE("  Input: %dx%d, %d channels\n",
+                        input->width, input->height, input->channels);
 
-        fseek(emb_file, 0, SEEK_END);
-        long file_size = ftell(emb_file);
-        fseek(emb_file, 0, SEEK_SET);
+            /* Use input image dimensions if not explicitly set */
+            if (!width_set) params.width = input->width;
+            if (!height_set) params.height = input->height;
 
-        int text_dim = FLUX_TEXT_DIM;
-        int text_seq = file_size / (text_dim * sizeof(float));
+            /* Generate */
+            output = flux_img2img(ctx, prompt, input, &params);
+            flux_image_free(input);
 
-        float *text_emb = (float *)malloc(file_size);
-        if (fread(text_emb, 1, file_size, emb_file) != (size_t)file_size) {
-            fprintf(stderr, "\nError: Failed to read embeddings file\n");
-            free(text_emb);
+        } else if (embeddings_path) {
+            /* ============== External embeddings mode ============== */
+            LOG_NORMAL("Loading embeddings...");
+            if (output_level >= OUTPUT_NORMAL) fflush(stderr);
+            timer_begin();
+
+            FILE *emb_file = fopen(embeddings_path, "rb");
+            if (!emb_file) {
+                fprintf(stderr, "\nError: Failed to open embeddings file: %s\n", embeddings_path);
+                flux_free(ctx);
+                return 1;
+            }
+
+            fseek(emb_file, 0, SEEK_END);
+            long file_size = ftell(emb_file);
+            fseek(emb_file, 0, SEEK_SET);
+
+            int text_dim = FLUX_TEXT_DIM;
+            int text_seq = file_size / (text_dim * sizeof(float));
+
+            float *text_emb = (float *)malloc(file_size);
+            if (fread(text_emb, 1, file_size, emb_file) != (size_t)file_size) {
+                fprintf(stderr, "\nError: Failed to read embeddings file\n");
+                free(text_emb);
+                fclose(emb_file);
+                flux_free(ctx);
+                return 1;
+            }
             fclose(emb_file);
+
+            LOG_NORMAL(" done (%.1fs)\n", timer_end());
+            LOG_VERBOSE("  Embeddings: %d tokens x %d dims (%.2f MB)\n",
+                        text_seq, text_dim, file_size / (1024.0 * 1024.0));
+
+            /* Load noise if provided */
+            float *noise = NULL;
+            int noise_size = 0;
+            if (noise_path) {
+                LOG_VERBOSE("Loading noise from %s...\n", noise_path);
+
+                FILE *noise_file = fopen(noise_path, "rb");
+                if (!noise_file) {
+                    fprintf(stderr, "Error: Failed to open noise file: %s\n", noise_path);
+                    free(text_emb);
+                    flux_free(ctx);
+                    return 1;
+                }
+
+                fseek(noise_file, 0, SEEK_END);
+                long noise_file_size = ftell(noise_file);
+                fseek(noise_file, 0, SEEK_SET);
+
+                noise_size = noise_file_size / sizeof(float);
+                noise = (float *)malloc(noise_file_size);
+                if (fread(noise, 1, noise_file_size, noise_file) != (size_t)noise_file_size) {
+                    fprintf(stderr, "Error: Failed to read noise file\n");
+                    free(noise);
+                    free(text_emb);
+                    fclose(noise_file);
+                    flux_free(ctx);
+                    return 1;
+                }
+                fclose(noise_file);
+                LOG_VERBOSE("  Noise: %d floats\n", noise_size);
+            }
+
+            /* Generate */
+            if (noise) {
+                output = flux_generate_with_embeddings_and_noise(ctx, text_emb, text_seq,
+                                                                  noise, noise_size, &params);
+                free(noise);
+            } else {
+                output = flux_generate_with_embeddings(ctx, text_emb, text_seq, &params);
+            }
+            free(text_emb);
+
+        } else {
+            /* ============== Text-to-image mode ============== */
+            /* Increment seed for each iteration to get different images */
+            if (iter > 0 && params.seed >= 0) {
+                params.seed++;
+                flux_set_seed(params.seed);
+            }
+            output = flux_generate(ctx, prompt, &params);
+        }
+
+        /* Finish progress display */
+        cli_finish_progress();
+
+        if (!output) {
+            fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
             flux_free(ctx);
             return 1;
         }
-        fclose(emb_file);
 
-        LOG_NORMAL(" done (%.1fs)\n", timer_end());
-        LOG_VERBOSE("  Embeddings: %d tokens x %d dims (%.2f MB)\n",
-                    text_seq, text_dim, file_size / (1024.0 * 1024.0));
+        struct timeval total_end_tv;
+        gettimeofday(&total_end_tv, NULL);
+        double total_time = (total_end_tv.tv_sec - total_start_tv.tv_sec) +
+                            (total_end_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
+        LOG_VERBOSE("Generated in %.1fs total\n", total_time);
+        LOG_VERBOSE("  Output: %dx%d, %d channels\n",
+                    output->width, output->height, output->channels);
 
-        /* Load noise if provided */
-        float *noise = NULL;
-        int noise_size = 0;
-        if (noise_path) {
-            LOG_VERBOSE("Loading noise from %s...\n", noise_path);
-
-            FILE *noise_file = fopen(noise_path, "rb");
-            if (!noise_file) {
-                fprintf(stderr, "Error: Failed to open noise file: %s\n", noise_path);
-                free(text_emb);
-                flux_free(ctx);
-                return 1;
+        /* Save output - add suffix for multiple outputs */
+        char actual_output[512];
+        if (repeat_count > 1) {
+            /* Insert iteration number before extension */
+            const char *dot = strrchr(output_path, '.');
+            if (dot) {
+                size_t base_len = dot - output_path;
+                snprintf(actual_output, sizeof(actual_output), "%.*s_%d%s",
+                         (int)base_len, output_path, iter + 1, dot);
+            } else {
+                snprintf(actual_output, sizeof(actual_output), "%s_%d", output_path, iter + 1);
             }
-
-            fseek(noise_file, 0, SEEK_END);
-            long noise_file_size = ftell(noise_file);
-            fseek(noise_file, 0, SEEK_SET);
-
-            noise_size = noise_file_size / sizeof(float);
-            noise = (float *)malloc(noise_file_size);
-            if (fread(noise, 1, noise_file_size, noise_file) != (size_t)noise_file_size) {
-                fprintf(stderr, "Error: Failed to read noise file\n");
-                free(noise);
-                free(text_emb);
-                fclose(noise_file);
-                flux_free(ctx);
-                return 1;
-            }
-            fclose(noise_file);
-            LOG_VERBOSE("  Noise: %d floats\n", noise_size);
-        }
-
-        /* Generate */
-        if (noise) {
-            output = flux_generate_with_embeddings_and_noise(ctx, text_emb, text_seq,
-                                                              noise, noise_size, &params);
-            free(noise);
         } else {
-            output = flux_generate_with_embeddings(ctx, text_emb, text_seq, &params);
+            strncpy(actual_output, output_path, sizeof(actual_output) - 1);
+            actual_output[sizeof(actual_output) - 1] = '\0';
         }
-        free(text_emb);
 
-    } else {
-        /* ============== Text-to-image mode ============== */
-        /* Note: flux_generate handles text encoding internally.
-         * We can't easily time it separately without modifying the library.
-         * The progress callbacks will show denoising progress. */
-        output = flux_generate(ctx, prompt, &params);
-    }
+        LOG_NORMAL("Saving...");
+        if (output_level >= OUTPUT_NORMAL) fflush(stderr);
+        timer_begin();
 
-    /* Finish progress display */
-    cli_finish_progress();
+        if (flux_image_save(output, actual_output) != 0) {
+            fprintf(stderr, "\nError: Failed to save image: %s\n", actual_output);
+            flux_image_free(output);
+            flux_free(ctx);
+            return 1;
+        }
 
-    if (!output) {
-        fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
-        flux_free(ctx);
-        return 1;
-    }
+        LOG_NORMAL(" %s (%.1fs)\n", actual_output, timer_end());
 
-    struct timeval total_end_tv;
-    gettimeofday(&total_end_tv, NULL);
-    double total_time = (total_end_tv.tv_sec - total_start_tv.tv_sec) +
-                        (total_end_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
-    LOG_VERBOSE("Generated in %.1fs total\n", total_time);
-    LOG_VERBOSE("  Output: %dx%d, %d channels\n",
-                output->width, output->height, output->channels);
+        /* Print iteration time */
+        struct timeval final_tv;
+        gettimeofday(&final_tv, NULL);
+        double iter_time = (final_tv.tv_sec - total_start_tv.tv_sec) +
+                           (final_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
+        if (iter == 0) {
+            LOG_NORMAL("Generation %d time: %.1f seconds (cold)\n", iter + 1, load_time + iter_time);
+        } else {
+            LOG_NORMAL("Generation %d time: %.1f seconds (warm)\n", iter + 1, iter_time);
+        }
 
-    /* Save output */
-    LOG_NORMAL("Saving...");
-    if (output_level >= OUTPUT_NORMAL) fflush(stderr);
-    timer_begin();
-
-    if (flux_image_save(output, output_path) != 0) {
-        fprintf(stderr, "\nError: Failed to save image: %s\n", output_path);
+        /* Cleanup output */
         flux_image_free(output);
-        flux_free(ctx);
-        return 1;
     }
 
-    LOG_NORMAL(" %s (%.1fs)\n", output_path, timer_end());
-
-    /* Print total time (always, unless quiet) */
-    struct timeval final_tv;
-    gettimeofday(&final_tv, NULL);
-    double total_time_final = (final_tv.tv_sec - total_start_tv.tv_sec) +
-                              (final_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
-    LOG_NORMAL("Total generation time: %.1f seconds\n", load_time + total_time_final);
+    /* Print summary for multi-generation runs */
+    if (repeat_count > 1) {
+        struct timeval session_end_tv;
+        gettimeofday(&session_end_tv, NULL);
+        double session_time = (session_end_tv.tv_sec - session_start_tv.tv_sec) +
+                              (session_end_tv.tv_usec - session_start_tv.tv_usec) / 1000000.0;
+        LOG_NORMAL("\n=== Summary ===\n");
+        LOG_NORMAL("Total: %d images in %.1f seconds (avg %.1f s/image after warmup)\n",
+                   repeat_count, load_time + session_time,
+                   repeat_count > 1 ? (session_time - (session_time / repeat_count)) / (repeat_count - 1) : session_time);
+    } else {
+        /* Single generation - print total time */
+        struct timeval final_tv;
+        gettimeofday(&final_tv, NULL);
+        double total_time_final = (final_tv.tv_sec - session_start_tv.tv_sec) +
+                                  (final_tv.tv_usec - session_start_tv.tv_usec) / 1000000.0;
+        LOG_NORMAL("Total generation time: %.1f seconds\n", load_time + total_time_final);
+    }
 
     /* Cleanup */
-    flux_image_free(output);
     flux_free(ctx);
 
 #ifdef USE_METAL

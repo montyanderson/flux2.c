@@ -15,6 +15,11 @@
 #include "flux_metal.h"
 #endif
 
+/* Use CUDA/cuBLAS for GPU acceleration on NVIDIA GPUs */
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#endif
+
 /* Use BLAS for matrix operations when enabled via Makefile */
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -181,6 +186,21 @@ void flux_matmul(float *C, const float *A, const float *B,
     }
 #endif
 
+#ifdef USE_CUDA
+    /* Use CUDA only for large matrices where GPU overhead is worth it
+     * Threshold: 256K elements = 256*1024 = ~1MB output */
+    if (flux_cuda_available() && (size_t)M * N >= 64 * 1024) {
+        flux_cuda_sgemm(0, 0,  /* no transpose */
+                        M, N, K,
+                        1.0f,
+                        A, K,
+                        B, N,
+                        0.0f,
+                        C, N);
+        return;
+    }
+#endif
+
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K,
@@ -214,6 +234,20 @@ void flux_matmul_t(float *C, const float *A, const float *B,
                          B, K,
                          0.0f,
                          C, N);
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    /* Use CUDA only for large matrices */
+    if (flux_cuda_available() && (size_t)M * N >= 64 * 1024) {
+        flux_cuda_sgemm(0, 1,  /* no transpose A, transpose B */
+                        M, N, K,
+                        1.0f,
+                        A, K,
+                        B, K,
+                        0.0f,
+                        C, N);
         return;
     }
 #endif
@@ -271,6 +305,29 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
                          W, in_dim,
                          0.0f,
                          y, out_dim);
+
+        /* Add bias if present */
+        if (b != NULL) {
+            for (int s = 0; s < seq_len; s++) {
+                for (int o = 0; o < out_dim; o++) {
+                    y[s * out_dim + o] += b[o];
+                }
+            }
+        }
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    /* Use CUDA GPU for large matrices only */
+    if (flux_cuda_available() && (size_t)seq_len * out_dim >= 64 * 1024) {
+        flux_cuda_sgemm(0, 1,  /* no transpose A, transpose B */
+                        seq_len, out_dim, in_dim,
+                        1.0f,
+                        x, in_dim,
+                        W, in_dim,
+                        0.0f,
+                        y, out_dim);
 
         /* Add bias if present */
         if (b != NULL) {
