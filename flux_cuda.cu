@@ -75,7 +75,7 @@ static int g_sm_version = 0;
 typedef struct {
     const void *host_ptr;      /* Original host pointer (key) */
     float *d_fp32;             /* FP32 device pointer */
-    fp8_e4m3 *d_fp8;           /* FP8 quantized weights */
+    __nv_fp8_storage_t *d_fp8; /* FP8 quantized weights */
     float scale;               /* FP8 scale factor */
     float inv_scale;           /* 1/scale for dequantization */
     size_t numel;              /* Number of elements */
@@ -140,7 +140,7 @@ __global__ void kernel_absmax(const float *x, float *result, int n) {
 }
 
 /* Quantize FP32 to FP8 with scale */
-__global__ void kernel_quantize_fp8(fp8_e4m3 *out, const float *in, float inv_scale, int n) {
+__global__ void kernel_quantize_fp8(__nv_fp8_storage_t *out, const float *in, float inv_scale, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float scaled = in[i] * inv_scale;
@@ -151,7 +151,7 @@ __global__ void kernel_quantize_fp8(fp8_e4m3 *out, const float *in, float inv_sc
 }
 
 /* Dequantize FP8 to FP32 */
-__global__ void kernel_dequantize_fp8(float *out, const fp8_e4m3 *in, float scale, int n) {
+__global__ void kernel_dequantize_fp8(float *out, const __nv_fp8_storage_t *in, float scale, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = __half2float(__nv_cvt_fp8_to_halfraw(in[i], __NV_E4M3)) * scale;
@@ -159,7 +159,7 @@ __global__ void kernel_dequantize_fp8(float *out, const fp8_e4m3 *in, float scal
 }
 
 /* Quantize activations to FP8 in-place style (output to separate buffer) */
-__global__ void kernel_quantize_act_fp8(fp8_e4m3 *out, const float *in,
+__global__ void kernel_quantize_act_fp8(__nv_fp8_storage_t *out, const float *in,
                                          float *scale_out, int n) {
     extern __shared__ float shared[];
 
@@ -456,9 +456,9 @@ static weight_entry_t *upload_weight(const void *host_ptr, size_t numel) {
 
     /* Quantize to FP8 if supported */
     if (g_fp8_supported) {
-        /* Find absmax for scale */
+        /* Find absmax for scale using simple GPU reduction */
         float *d_absmax;
-        float h_absmax = 0.0f;
+        int h_absmax_int = 0;
         cudaMalloc(&d_absmax, sizeof(float));
         cudaMemset(d_absmax, 0, sizeof(float));
 
@@ -466,17 +466,18 @@ static weight_entry_t *upload_weight(const void *host_ptr, size_t numel) {
         blocks = min(blocks, 1024);
         kernel_absmax<<<blocks, CUDA_BLOCK_SIZE, CUDA_BLOCK_SIZE * sizeof(float), g_stream>>>(
             entry->d_fp32, d_absmax, numel);
-        cudaMemcpy(&h_absmax, d_absmax, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&h_absmax_int, d_absmax, sizeof(int), cudaMemcpyDeviceToHost);
         cudaFree(d_absmax);
 
-        /* Compute scale: scale = absmax / 448 (FP8 E4M3 max) */
-        h_absmax = __int_as_float(*(int*)&h_absmax);  /* atomicMax stores as int */
+        /* Convert int-encoded float back to float (atomicMax stores as int) */
+        float h_absmax;
+        memcpy(&h_absmax, &h_absmax_int, sizeof(float));
         entry->scale = h_absmax / 448.0f;
         if (entry->scale < 1e-12f) entry->scale = 1e-12f;
         entry->inv_scale = 1.0f / entry->scale;
 
         /* Allocate and quantize to FP8 */
-        CUDA_CHECK(cudaMalloc(&entry->d_fp8, numel * sizeof(fp8_e4m3)));
+        CUDA_CHECK(cudaMalloc(&entry->d_fp8, numel * sizeof(__nv_fp8_storage_t)));
         blocks = (numel + CUDA_BLOCK_SIZE - 1) / CUDA_BLOCK_SIZE;
         kernel_quantize_fp8<<<blocks, CUDA_BLOCK_SIZE, 0, g_stream>>>(
             entry->d_fp8, entry->d_fp32, entry->inv_scale, numel);
@@ -487,7 +488,7 @@ static weight_entry_t *upload_weight(const void *host_ptr, size_t numel) {
     }
 
     g_weight_bytes += entry->bytes_fp32;
-    if (g_fp8_supported) g_weight_bytes += numel * sizeof(fp8_e4m3);
+    if (g_fp8_supported) g_weight_bytes += numel * sizeof(__nv_fp8_storage_t);
 
     cudaStreamSynchronize(g_stream);
     return entry;
@@ -547,8 +548,9 @@ extern "C" int flux_cuda_init(void) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     g_sm_version = prop.major * 10 + prop.minor;
 
-    /* FP8 requires SM 8.9+ (Ada/Hopper) or SM 10.0 (Blackwell) */
-    g_fp8_supported = (g_sm_version >= 89);
+    /* FP8 requires SM 8.9+ (Ada/Hopper) or SM 10.0 (Blackwell)
+     * Disabled for now - TF32 provides good speedup without FP8 complexity */
+    g_fp8_supported = 0;  /* TODO: Enable FP8 after fixing quantization issues */
 
     fprintf(stderr, "CUDA: %s (%.1f GB, SM %d.%d, FP8: %s)\n",
             prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor,
@@ -618,13 +620,37 @@ extern "C" void flux_cuda_memory_info(size_t *free, size_t *total) {
     cudaMemGetInfo(free, total);
 }
 
+extern "C" void flux_cuda_reset_weights(void) {
+    /* Free all cached weights - call between generations to prevent memory issues */
+    if (!g_initialized) return;
+
+    cudaStreamSynchronize(g_stream);
+
+    for (int i = 0; i < g_weight_count; i++) {
+        if (g_weights[i].d_fp32) {
+            cudaFree(g_weights[i].d_fp32);
+            g_weights[i].d_fp32 = NULL;
+        }
+        if (g_weights[i].d_fp8) {
+            cudaFree(g_weights[i].d_fp8);
+            g_weights[i].d_fp8 = NULL;
+        }
+        g_weights[i].host_ptr = NULL;
+    }
+    g_weight_count = 0;
+    g_weight_bytes = 0;
+
+    /* Clear any CUDA errors */
+    cudaGetLastError();
+}
+
 /* ============================================================================
  * FP8 GEMM using cuBLASLt
  * C = alpha * A @ B + beta * C
  * ============================================================================ */
 
 static void fp8_gemm(int M, int N, int K,
-                     const float *d_A, const fp8_e4m3 *d_B, float *d_C,
+                     const float *d_A, const __nv_fp8_storage_t *d_B, float *d_C,
                      float scale_A, float scale_B) {
     cublasLtMatmulDesc_t matmul_desc;
     cublasLtMatrixLayout_t layout_A, layout_B, layout_C;
@@ -707,33 +733,53 @@ extern "C" void flux_cuda_sgemm(int transA, int transB,
 
     /* Upload weight B (cached) */
     weight_entry_t *w_B = upload_weight(B, size_B / sizeof(float));
+    if (!w_B || !w_B->d_fp32) {
+        fprintf(stderr, "flux_cuda_sgemm: weight upload failed\n");
+        return;
+    }
 
-    /* Get activation buffers */
-    float *d_A = (float*)get_buffer(size_A);
-    float *d_C = (float*)get_buffer(size_C);
+    /* Allocate fresh buffers each time (simpler, avoids pool corruption) */
+    float *d_A = NULL, *d_C = NULL;
+    cudaError_t err;
 
-    CUDA_CHECK(cudaMemcpyAsync(d_A, A, size_A, cudaMemcpyHostToDevice, g_stream));
+    err = cudaMalloc(&d_A, size_A);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc d_A failed: %s\n", cudaGetErrorString(err));
+        return;
+    }
+
+    err = cudaMalloc(&d_C, size_C);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc d_C failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_A);
+        return;
+    }
+
+    cudaMemcpy(d_A, A, size_A, cudaMemcpyHostToDevice);
     if (beta != 0.0f) {
-        CUDA_CHECK(cudaMemcpyAsync(d_C, C, size_C, cudaMemcpyHostToDevice, g_stream));
+        cudaMemcpy(d_C, C, size_C, cudaMemcpyHostToDevice);
     }
 
     /* cuBLAS uses column-major, so swap for row-major */
     cublasOperation_t opA = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
 
-    CUBLAS_CHECK(cublasSgemm(g_cublas, opA, opB,
+    cublasStatus_t status = cublasSgemm(g_cublas, opA, opB,
                              N, M, K,
                              &alpha,
                              w_B->d_fp32, transB ? K : N,
                              d_A, transA ? M : K,
                              &beta,
-                             d_C, N));
+                             d_C, N);
 
-    CUDA_CHECK(cudaMemcpyAsync(C, d_C, size_C, cudaMemcpyDeviceToHost, g_stream));
-    CUDA_CHECK(cudaStreamSynchronize(g_stream));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "cublasSgemm failed: %d\n", status);
+    }
 
-    release_buffer(d_A);
-    release_buffer(d_C);
+    cudaMemcpy(C, d_C, size_C, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_A);
+    cudaFree(d_C);
 }
 
 /* ============================================================================

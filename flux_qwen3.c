@@ -30,10 +30,15 @@
 #include "flux_metal.h"
 #endif
 
+/* Use CUDA for GPU acceleration */
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#endif
+
 /* Minimum matrix size for GPU acceleration. Lower threshold to use GPU for more
  * operations (K/V projections ~262K, output/down ~655K, gate/up ~2.5M).
  * Note: Very small matrices may have GPU sync overhead > BLAS compute time. */
-#define QWEN3_MIN_GPU_ELEMENTS (256 * 1024)
+#define QWEN3_MIN_GPU_ELEMENTS (64 * 1024)
 
 /* ========================================================================
  * Data Structures
@@ -106,10 +111,25 @@ struct qwen3_model {
 static void qwen3_linear(float *y, const float *x, const float *W,
                          int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T */
-#ifdef USE_METAL
-    /* Use GPU for large matrices */
+#ifdef USE_CUDA
+    /* Use CUDA GPU for large matrices */
     size_t matrix_elements = (size_t)seq_len * out_dim;
-    if (flux_metal_available() && matrix_elements >= QWEN3_MIN_GPU_ELEMENTS) {
+    if (flux_cuda_available() && matrix_elements >= QWEN3_MIN_GPU_ELEMENTS) {
+        flux_cuda_sgemm(0, 1,  /* no transpose A, transpose B */
+                        seq_len, out_dim, in_dim,
+                        1.0f,
+                        x, in_dim,
+                        W, in_dim,
+                        0.0f,
+                        y, out_dim);
+        return;
+    }
+#endif
+
+#ifdef USE_METAL
+    /* Use Metal GPU for large matrices */
+    size_t matrix_elements_m = (size_t)seq_len * out_dim;
+    if (flux_metal_available() && matrix_elements_m >= QWEN3_MIN_GPU_ELEMENTS) {
         flux_metal_sgemm(0, 1,  /* no transpose A, transpose B */
                          seq_len, out_dim, in_dim,
                          1.0f,

@@ -25,6 +25,7 @@ int flux_cuda_available(void);
 int flux_cuda_fp8_available(void);  /* FP8 tensor cores (SM 8.9+) */
 void flux_cuda_synchronize(void);
 void flux_cuda_memory_info(size_t *free, size_t *total);
+void flux_cuda_reset_weights(void);  /* Clear weight cache between generations */
 
 /* ============================================================================
  * Memory Management

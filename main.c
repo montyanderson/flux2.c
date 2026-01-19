@@ -400,6 +400,13 @@ int main(int argc, char *argv[]) {
             LOG_NORMAL("\n=== Generation %d/%d ===\n", iter + 1, repeat_count);
         }
 
+#ifdef USE_CUDA
+        /* Reset CUDA weight cache between generations to prevent memory issues */
+        if (iter > 0 && flux_cuda_available()) {
+            flux_cuda_reset_weights();
+        }
+#endif
+
         /* Generate image */
         flux_image *output = NULL;
         struct timeval total_start_tv;
