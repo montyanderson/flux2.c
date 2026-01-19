@@ -111,7 +111,7 @@ CUDA_PATH ?= /usr/local/cuda
 NVCC = $(CUDA_PATH)/bin/nvcc
 CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -DUSE_BLAS -DUSE_OPENBLAS -I$(CUDA_PATH)/include -I/usr/include/openblas
 CUDA_NVCCFLAGS = -O3 -arch=native --compiler-options -fPIC
-CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lstdc++ -lopenblas
+CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lcublasLt -lstdc++ -lopenblas
 
 cuda: clean cuda-build
 	@echo ""
